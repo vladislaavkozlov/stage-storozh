@@ -1,0 +1,56 @@
+# Сторож прода Stage (15.10.2026). Раз в 5 минут проверяет app.vladkozlovdigital.ru/health
+# и пишет Владу в Telegram, если прод не отвечает. Работает на GitHub, вне Amvera:
+# если упадёт весь регион Amvera, сторож упадёт не вместе с продом.
+#
+# Состояние между запусками (лежит ли прод и когда последний раз напоминали) - в кэше
+# GitHub: каждый запуск сохраняет новый ключ, следующий берёт самый свежий по префиксу
+name: storozh-proda
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+concurrency:
+  group: storozh
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Прошлое состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: storozh-state-${{ github.run_id }}
+          restore-keys: storozh-state-
+      - name: Проверка прода
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: node storozh.mjs
+      - name: Новое состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: storozh-state-${{ github.run_id }}
+  # GitHub выключает расписание в открытом репозитории, где 60 дней не было изменений.
+  # Раз в месяц сторож сам делает пустой коммит, чтобы его не выключили
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '*/5 * * * *'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Пустой коммит раз в месяц
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt 2592000 ]; then
+            git config user.name storozh
+            git config user.email storozh@users.noreply.github.com
+            git commit --allow-empty -m "Сторож жив: раз в месяц, чтобы GitHub не выключил расписание"
+            git push
+          fi
