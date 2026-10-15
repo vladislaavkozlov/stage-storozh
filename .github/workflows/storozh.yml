@@ -8,7 +8,12 @@ name: storozh-proda
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      proverka:
+        description: 'Прислать в Telegram пробное сообщение'
+        type: boolean
+        default: false
 concurrency:
   group: storozh
   cancel-in-progress: false
@@ -28,6 +33,7 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          STOROZH_PROVERKA: ${{ inputs.proverka }}
         run: node storozh.mjs
       - name: Новое состояние
         if: always()

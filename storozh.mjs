@@ -43,6 +43,10 @@ async function tell(text) {
 const prev = existsSync(STATE) ? JSON.parse(readFileSync(STATE, 'utf8')) : { down: false };
 const now = Date.now();
 const r = await check();
+// Ручной запуск с галочкой «проверка» - доказать, что сторож на GitHub может писать
+if (process.env.STOROZH_PROVERKA === 'true') {
+  await tell(`🔧 Проверка связи: сторож на GitHub на месте (${msk()} МСК). Прод сейчас ${r.up ? 'отвечает' : `не отвечает: ${r.why}`}`);
+}
 let next = prev;
 
 if (r.up && prev.down) {
