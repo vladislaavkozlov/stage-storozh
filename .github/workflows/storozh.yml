@@ -1,6 +1,11 @@
-# Сторож прода Stage (15.10.2026). Раз в 5 минут проверяет app.vladkozlovdigital.ru/health
-# и пишет Владу в Telegram, если прод не отвечает. Работает на GitHub, вне Amvera:
-# если упадёт весь регион Amvera, сторож упадёт не вместе с продом.
+# Сторож прода Stage (15.10.2026). Раз в минуту проверяет app.wellstage.ru/health и
+# онлайн-запись заведений (с 19.10.2026) и пишет Владу в Telegram, если что-то не
+# отвечает. Работает на GitHub, вне Amvera: если упадёт весь регион Amvera, сторож
+# упадёт не вместе с продом.
+#
+# Один запуск идёт почти 6 часов и сам проверяет раз в минуту: расписание «раз в 5
+# минут» GitHub выполнял раз в 2-4 часа. Следующий запуск по расписанию ждёт в
+# очереди и стартует, как только предыдущий закончится
 #
 # Состояние между запусками (лежит ли прод и когда последний раз напоминали) - в кэше
 # GitHub: каждый запуск сохраняет новый ключ, следующий берёт самый свежий по префиксу
@@ -15,12 +20,13 @@ on:
         type: boolean
         default: false
 concurrency:
-  group: storozh
+  # Проверка связи идёт отдельно, иначе ждала бы в очереди за долгим запуском
+  group: storozh-${{ inputs.proverka == true && 'proverka' || 'cikl' }}
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - name: Прошлое состояние
@@ -34,9 +40,10 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           STOROZH_PROVERKA: ${{ inputs.proverka }}
+          STOROZH_MINUTES: '345'
         run: node storozh.mjs
       - name: Новое состояние
-        if: always()
+        if: always() && inputs.proverka != true
         uses: actions/cache/save@v4
         with:
           path: state
