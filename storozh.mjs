@@ -17,6 +17,15 @@
 // настоящее падение утонуло бы в этом шуме. Теперь сигнал - если прод не отвечает
 // три проверки подряд (~3 минуты), «снова работает» - после двух удачных подряд.
 // Короткие обрывы не пропадают: их число приходит в утренней сводке за сутки
+//
+// Вторая точка в России (24.10.2026, Влад: «если первая рвётся, проверяется вторая;
+// если там всё хорошо - тревога ложная, если обе бьются - оповещать»). Когда до
+// сервера не достучались вовсе, сторож просит check-host.net открыть тот же адрес
+// с трёх узлов в Москве и Петербурге (бесплатно, без ключа). Хоть один узел получил
+// 200 - сервер для клиентов работает, сигнала нет. Не открылось и из России - это
+// падение, сигнал через две такие минуты подряд. Сервер ответил ошибкой (500, 504) -
+// до него дошли, спрашивать Россию незачем: тоже две минуты подряд. check-host сам
+// недоступен - старое правило трёх минут
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 
 const BASE = process.env.STOROZH_BASE ?? 'https://app.wellstage.ru';
@@ -32,6 +41,7 @@ const TRIES = 2;
 const PAUSE_MS = Number(process.env.STOROZH_PAUSE_MS ?? 5_000);
 const DOWN_ROUNDS = 3;
 const UP_ROUNDS = 2;
+const REAL_ROUNDS = 2;
 const REMIND_MS = 30 * 60_000;
 const EVERY_MS = Number(process.env.STOROZH_EVERY_MS ?? 60_000);
 const RUN_MS = Number(process.env.STOROZH_MINUTES ?? 0) * 60_000;
@@ -70,7 +80,7 @@ async function get(url) {
 // вовсе, иначе сервер ответил, но не так
 async function probeProd() {
   const r = await get(URL);
-  if (r.net) return { ok: false, net: true, why: r.why };
+  if (r.net) return { ok: false, net: true, why: r.why, url: URL };
   let body = null;
   try { body = JSON.parse(r.body); } catch { body = null; }
   if (r.status === 200 && body?.ok === true) return { ok: true, ms: r.ms, startedAt: body.startedAt };
@@ -86,7 +96,7 @@ async function probeZapis({ slug }) {
   ];
   for (const [what, url, ok] of steps) {
     const r = await get(url);
-    if (r.net) return { ok: false, net: true, why: `${what}: ${r.why}` };
+    if (r.net) return { ok: false, net: true, why: `${what}: ${r.why}`, url };
     if (r.status !== 200) return { ok: false, net: false, why: `${what}: ответ ${r.status}` };
     let good = false;
     try { good = ok(r.body); } catch { good = false; }
@@ -95,12 +105,42 @@ async function probeZapis({ slug }) {
   return { ok: true };
 }
 
+// Открыть адрес с узлов в России: 'ok' - хоть один получил 200, 'down' - не
+// получил никто и ответили хотя бы два, null - сам check-host не ответил
+const RU_NODES = ['ru1.node.check-host.net', 'ru2.node.check-host.net', 'ru3.node.check-host.net'];
+const CHECK_HOST = process.env.STOROZH_CHECK_HOST ?? 'https://check-host.net';
+async function russia(url) {
+  try {
+    const q = `host=${encodeURIComponent(url)}&${RU_NODES.map((n) => `node=${n}`).join('&')}`;
+    const opts = { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) };
+    const { request_id: id } = await (await fetch(`${CHECK_HOST}/check-http?${q}`, opts)).json();
+    if (!id) return null;
+    let res = {};
+    for (let i = 0; i < 8; i += 1) {
+      await sleep(3_000);
+      res = await (await fetch(`${CHECK_HOST}/check-result/${id}`, { ...opts, signal: AbortSignal.timeout(15_000) })).json();
+      if (Object.values(res).every((v) => v !== null)) break;
+    }
+    const done = Object.values(res).filter((v) => Array.isArray(v) && Array.isArray(v[0]));
+    if (done.some((v) => v[0][0] === 1 && String(v[0][3]) === '200')) return 'ok';
+    return done.length >= 2 ? 'down' : null;
+  } catch (err) {
+    console.log(`check-host недоступен: ${err.cause?.code ?? err.message}`);
+    return null;
+  }
+}
+
 async function withRetries(probe) {
   let r = null;
   for (let i = 0; i < TRIES; i += 1) {
     r = await probe();
     if (r.ok) return r;
     if (i < TRIES - 1) await sleep(PAUSE_MS);
+  }
+  // До сервера не достучались - спросить Россию, не дорога ли из США рвётся
+  if (r.net) {
+    r.ru = await russia(r.url);
+    if (r.ru === 'ok') return { ok: true, fake: true, why: r.why };
   }
   return r;
 }
@@ -176,7 +216,7 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
   const s = { down: false, fails: 0, oks: 0, ...prev };
   if (r.ok) {
     if (!s.down) {
-      if (s.fails > 0) onBlip();
+      if (s.fails > 0 || r.fake) onBlip();
       return { down: false, fails: 0, oks: 0 };
     }
     s.oks += 1;
@@ -188,8 +228,10 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
   s.oks = 0;
   if (!s.down) {
     s.fails += 1;
-    if (s.fails === 1) s.firstFail = now;
-    if (s.fails < DOWN_ROUNDS) return s;
+    if (s.fails === 1) { s.firstFail = now; s.real = 0; }
+    // Подтверждённый сбой: сервер ответил ошибкой или не открылся и из России
+    if (!r.net || r.ru === 'down') s.real = (s.real ?? 0) + 1;
+    if (s.real < REAL_ROUNDS && s.fails < DOWN_ROUNDS) return s;
     await tell(texts.down(r, s.firstFail));
     return { down: true, since: s.firstFail, reminded: now, why: r.why, fails: 0, oks: 0 };
   }
@@ -203,7 +245,8 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
 
 // Что значит ответ прода - чтобы сообщение сразу говорило, куда смотреть
 function prodCause(r) {
-  if (r.net) return 'сервер не отвечает вовсе: лежит Amvera или связь до неё. Открой app.wellstage.ru с телефона - если не открывается, смотри панель Amvera';
+  if (r.net && r.ru === 'down') return 'сервер не открывается ни из США, ни из Москвы и Петербурга - скорее всего лежит Amvera. Смотри панель Amvera';
+  if (r.net) return 'сервер не отвечает вовсе, проверить из России не удалось. Открой app.wellstage.ru с телефона - если не открывается, смотри панель Amvera';
   if (r.status === 500) return 'сервер работает, но не достучался до базы. Первым делом проверь базу proddb в панели Amvera';
   if (r.status >= 502 && r.status <= 504) return 'Amvera не видит запущенное приложение: оно перезапускается или упало. Если не пройдёт за 5 минут - смотри журнал приложения в панели Amvera';
   return 'сервер отвечает не так, как должен';
@@ -223,7 +266,7 @@ async function round() {
 
   const prod = await withRetries(probeProd);
   day.rounds += 1;
-  if (prod.ok) {
+  if (prod.ok && !prod.fake) {
     day.ms.push(prod.ms);
     // Сервер перезапустился - выкладка или сбой. Срочно не пишем, только в сводку
     // и в сообщение о восстановлении, если перезапуск пришёлся на падение
@@ -243,9 +286,10 @@ async function round() {
     },
   }, () => { day.blips += 1; }, (o) => day.outages.push({ what: 'prod', ...o }));
 
-  const lines = [prod.ok ? `прод отвечает ${prod.ms} мс` : `прод не отвечает: ${prod.why}`];
-  // Прод не ответил - запись не проверяем: о падении скажет сообщение про прод
-  if (prod.ok) {
+  const lines = [prod.fake ? `прод из США не открылся (${prod.why}), из России отвечает` : prod.ok ? `прод отвечает ${prod.ms} мс` : `прод не отвечает: ${prod.why}${prod.ru ? `, из России: ${prod.ru}` : ''}`];
+  // Прод не ответил - запись не проверяем: о падении скажет сообщение про прод.
+  // Не открылся из США - тоже: в эту минуту дорога рвётся и для записи
+  if (prod.ok && !prod.fake) {
     for (const z of ZAVEDENIYA) {
       const link = `${BASE}/${z.slug}/zapis`;
       const r = await withRetries(() => probeZapis(z));
@@ -283,7 +327,7 @@ function digestText(key, d) {
   if (ms.length) out.push(`Скорость ответа: обычно ${sec(ms[Math.floor(ms.length / 2)])}, медленнее всего ${sec(ms[ms.length - 1])}`);
   if (d.restarts.length) out.push(`Перезапуски сервера (выкладка или сбой): ${d.restarts.map(hm).join(', ')}`);
   const zb = Object.entries(d.zapisBlips).map(([s, n]) => `${s} ${n}`).join(', ');
-  out.push(`Короткие обрывы связи GitHub - Amvera, без сигнала: прод ${d.blips}${zb ? `, запись ${zb}` : ''}. Это сеть до сервера, клиенты их скорее всего не заметили`);
+  out.push(`Ложные тревоги без сигнала: прод ${d.blips}${zb ? `, запись ${zb}` : ''}. Из США сервер в эти минуты не открывался, а из России работал или сбой был короче 2-3 минут - клиенты их не заметили`);
   const gapMs = d.gaps.reduce((a, g) => a + (g.to - g.from), 0);
   out.push(gapMs
     ? `Сторож сам не работал ${dur(gapMs)} - в это время прод не проверялся`
