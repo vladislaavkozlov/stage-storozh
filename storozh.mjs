@@ -347,13 +347,21 @@ function digestText(key, d) {
 function kopiyaText(now) {
   const k = state.kopiya;
   if (k === undefined) return null;
-  if (k === null) return { line: 'Копия базы в облако на проде не включена' };
+  if (k === null) return { line: 'Копия базы на Диск на проде не включена' };
   const segodnya = new Date(now).toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
-  const kogda = `${k.date.slice(8, 10)}.${k.date.slice(5, 7)}`;
-  if (k.date === segodnya) return { line: `Копия базы в облаке: за ${kogda}, ${Math.round(k.size / 1024)} КБ` };
+  const dm = (d) => `${d.slice(8, 10)}.${d.slice(5, 7)}`;
+  // Токен Диска выдаётся на год. За 30 дней до конца - предупреждение каждое утро
+  const dney = k.tokenDo ? Math.floor((Date.parse(k.tokenDo) - Date.parse(segodnya)) / 86_400_000) : null;
+  const token = dney !== null && dney <= 30
+    ? `\n🔑 Доступ сервера к Яндекс Диску ${dney > 0 ? `закончится через ${dney} дн. (${dm(k.tokenDo)})` : 'закончился'} - его нужно продлить, иначе копии перестанут сниматься`
+    : '';
+  if (k.date === segodnya) {
+    return { line: `Копия базы на Диске: за ${dm(k.date)}, ${Math.round(k.size / 1024)} КБ`, alarm: token ? token.trim() : null };
+  }
+  const posl = k.date ? `последняя на Диске за ${dm(k.date)}` : 'копий на Диске ещё не было';
   return {
-    line: `Копии базы за сегодня нет, последняя за ${kogda}`,
-    alarm: `💾 Копия базы Wellstage за сегодня не снята - последняя в облаке за ${kogda}.\nПрод работает, данные на месте, но ночная страховка не сработала. Причина - в журнале прода Amvera, строка «копия в облако не прошла»`,
+    line: `Копии базы за сегодня нет, ${posl}`,
+    alarm: `💾 Копия базы Wellstage за сегодня не снята - ${posl}.\nПрод работает, данные на месте, но ночная страховка не сработала. Причина - в журнале прода Amvera, строка «копия в облако не прошла»${token}`,
   };
 }
 
