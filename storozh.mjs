@@ -83,7 +83,7 @@ async function probeProd() {
   if (r.net) return { ok: false, net: true, why: r.why, url: URL };
   let body = null;
   try { body = JSON.parse(r.body); } catch { body = null; }
-  if (r.status === 200 && body?.ok === true) return { ok: true, ms: r.ms, startedAt: body.startedAt };
+  if (r.status === 200 && body?.ok === true) return { ok: true, ms: r.ms, startedAt: body.startedAt, kopiya: body.kopiya };
   return { ok: false, net: false, why: `ответ ${r.status}`, status: r.status };
 }
 
@@ -274,6 +274,9 @@ async function round() {
       day.restarts.push(Date.parse(prod.startedAt));
     }
     if (prod.startedAt) state.startedAt = prod.startedAt;
+    // Последняя копия базы в Яндекс Облаке (30.10.2026): null - на проде не включена,
+    // undefined - версия сервера без копии. Смотрится утром в сводке
+    if (prod.kopiya !== undefined) state.kopiya = prod.kopiya;
   }
   state.prod = await step(state.prod, prod, now, {
     down: (r, since) => `🔴 Wellstage не работает с ${hm(since)} МСК (${r.why}).\nКабинеты клиентов и онлайн-запись сейчас не открываются.\nЧто это значит: ${prodCause(r)}`,
@@ -302,6 +305,9 @@ async function round() {
       lines.push(`запись ${z.slug}: ${r.ok ? 'открывается' : r.why}`);
     }
   }
+
+  const kopiya = kopiyaText(now);
+  if (kopiya) lines.push(kopiya.line);
 
   state.lastRound = now;
   if (!PROVERKA) await maybeDigest(now);
@@ -335,11 +341,29 @@ function digestText(key, d) {
   return out.join('\n');
 }
 
+// Копия базы: сервер прода сам снимает её после 3:00 МСК и кладёт в Яндекс Облако.
+// К утренней сводке сегодняшняя обязана быть. Нет - отдельным сообщением, а не
+// строкой в сводке: страховка без копии - это не страховка
+function kopiyaText(now) {
+  const k = state.kopiya;
+  if (k === undefined) return null;
+  if (k === null) return { line: 'Копия базы в облако на проде не включена' };
+  const segodnya = new Date(now).toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
+  const kogda = `${k.date.slice(8, 10)}.${k.date.slice(5, 7)}`;
+  if (k.date === segodnya) return { line: `Копия базы в облаке: за ${kogda}, ${Math.round(k.size / 1024)} КБ` };
+  return {
+    line: `Копии базы за сегодня нет, последняя за ${kogda}`,
+    alarm: `💾 Копия базы Wellstage за сегодня не снята - последняя в облаке за ${kogda}.\nПрод работает, данные на месте, но ночная страховка не сработала. Причина - в журнале прода Amvera, строка «копия в облако не прошла»`,
+  };
+}
+
 async function maybeDigest(now) {
   if (hourOf(now) < DIGEST_HOUR) return;
   const key = dayOf(now - 86_400_000);
   if (state.digestFor === key || !state.days[key]) return;
-  await tell(digestText(key, state.days[key]));
+  const kopiya = kopiyaText(now);
+  await tell(digestText(key, state.days[key]) + (kopiya ? `\n${kopiya.line}` : ''));
+  if (kopiya?.alarm) await tell(kopiya.alarm);
   state.digestFor = key;
 }
 
