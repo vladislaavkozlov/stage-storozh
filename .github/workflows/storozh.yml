@@ -27,6 +27,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    # Сам себя запускает следом (05.11.2026): расписание GitHub после конца запуска
+    # подхватывало следующий через час и больше - 04.11 сторож молчал 17:46-18:52
+    permissions:
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Прошлое состояние
@@ -35,12 +40,18 @@ jobs:
           path: state
           key: storozh-state-${{ github.run_id }}
           restore-keys: storozh-state-
+      # Лимит на шаге, а не только на всём запуске (05.11.2026). 03.11 последняя проверка
+      # затянулась, GitHub оборвал запуск целиком по лимиту 355 минут, и шаг «Новое
+      # состояние» не выполнился: следующий запуск взял состояние шестичасовой давности
+      # и записал в сводку «сторож не работал 9 ч», хотя он работал. Теперь обрывается
+      # только этот шаг, а состояние сохраняется
       - name: Проверка прода
+        timeout-minutes: 340
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           STOROZH_PROVERKA: ${{ inputs.proverka }}
-          STOROZH_MINUTES: '345'
+          STOROZH_MINUTES: '330'
         run: node storozh.mjs
       - name: Новое состояние
         if: always() && inputs.proverka != true
@@ -48,6 +59,11 @@ jobs:
         with:
           path: state
           key: storozh-state-${{ github.run_id }}
+      - name: Следующий запуск сразу
+        if: always() && inputs.proverka != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run storozh.yml --ref ${{ github.ref_name }} -f proverka=false
   # GitHub выключает расписание в открытом репозитории, где 60 дней не было изменений.
   # Раз в месяц сторож сам делает пустой коммит, чтобы его не выключили
   keepalive:
