@@ -37,6 +37,14 @@ const ZAVEDENIYA = process.env.STOROZH_ZAVEDENIYA
     { slug: 'urbashevichus', name: 'Карины (Урбашевичус)' },
     { slug: 'alikhan', name: 'Алихана' },
   ];
+// Ссылка «проверь сам» в тревоге о проде (07.11.2026). Главная app.wellstage.ru пустая
+// («Откройте кабинет по ссылке вашего заведения») и открывается, даже когда база лежит.
+// Страница записи первого заведения тянет из базы название, врачей и свободное время -
+// видно их, значит работает весь Wellstage
+const PROVERIT = ZAVEDENIYA[0] ? `${BASE}/${ZAVEDENIYA[0].slug}/zapis` : `${BASE}/health`;
+const PROVERIT_TEKST = ZAVEDENIYA[0]
+  ? `Проверь сам с телефона: ${PROVERIT}\nВидишь название клиники и врачей - всё работает, тревога ложная. Пустая страница или ошибка - смотри панель Amvera`
+  : `Проверь сам: ${PROVERIT}`;
 const TRIES = 2;
 const PAUSE_MS = Number(process.env.STOROZH_PAUSE_MS ?? 5_000);
 const DOWN_ROUNDS = 3;
@@ -246,7 +254,7 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
 // Что значит ответ прода - чтобы сообщение сразу говорило, куда смотреть
 function prodCause(r) {
   if (r.net && r.ru === 'down') return 'сервер не открывается ни из США, ни из Москвы и Петербурга - скорее всего лежит Amvera. Смотри панель Amvera';
-  if (r.net) return 'сервер не отвечает вовсе, проверить из России не удалось. Открой app.wellstage.ru с телефона - если не открывается, смотри панель Amvera';
+  if (r.net) return 'сервер не отвечает из США, проверить из России не удалось. Часто это обрыв связи США - Amvera, а не падение';
   if (r.status === 500) return 'сервер работает, но не достучался до базы. Первым делом проверь базу proddb в панели Amvera';
   if (r.status >= 502 && r.status <= 504) return 'Amvera не видит запущенное приложение: оно перезапускается или упало. Если не пройдёт за 5 минут - смотри журнал приложения в панели Amvera';
   return 'сервер отвечает не так, как должен';
@@ -279,8 +287,8 @@ async function round() {
     if (prod.kopiya !== undefined) state.kopiya = prod.kopiya;
   }
   state.prod = await step(state.prod, prod, now, {
-    down: (r, since) => `🔴 Wellstage не работает с ${hm(since)} МСК (${r.why}).\nКабинеты клиентов и онлайн-запись сейчас не открываются.\nЧто это значит: ${prodCause(r)}`,
-    still: (since, at, r) => `🔴 Wellstage всё ещё не работает: ${dur(at - since)} (${r.why})`,
+    down: (r, since) => `🔴 Wellstage не работает с ${hm(since)} МСК (${r.why}).\nКабинеты клиентов и онлайн-запись сейчас не открываются.\nЧто это значит: ${prodCause(r)}\n\n${PROVERIT_TEKST}`,
+    still: (since, at, r) => `🔴 Wellstage всё ещё не работает: ${dur(at - since)} (${r.why})\nПроверить: ${PROVERIT}`,
     back: (since, at) => {
       const restart = state.startedAt && Date.parse(state.startedAt) >= since
         ? `\nСервер за это время перезапустился в ${hm(Date.parse(state.startedAt))}`
