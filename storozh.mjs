@@ -47,7 +47,9 @@ const PROVERIT_TEKST = ZAVEDENIYA[0]
   : `Проверь сам: ${PROVERIT}`;
 const TRIES = 2;
 const PAUSE_MS = Number(process.env.STOROZH_PAUSE_MS ?? 5_000);
-const DOWN_ROUNDS = 3;
+// Из США не открывается столько минут подряд, а Россию спросить не удалось ни одним
+// сервисом - не тревога, а просьба проверить самому (07.11.2026)
+const UNKNOWN_ROUNDS = 10;
 const UP_ROUNDS = 2;
 const REAL_ROUNDS = 2;
 const REMIND_MS = 30 * 60_000;
@@ -113,29 +115,84 @@ async function probeZapis({ slug }) {
   return { ok: true };
 }
 
-// Открыть адрес с узлов в России: 'ok' - хоть один получил 200, 'down' - не
-// получил никто и ответили хотя бы два, null - сам check-host не ответил
-const RU_NODES = ['ru1.node.check-host.net', 'ru2.node.check-host.net', 'ru3.node.check-host.net'];
+// Проверка из России (07.11.2026, Влад: «сначала найди возможность проверить из
+// России, потом говори, что это падение»). Два независимых бесплатных сервиса без
+// ключа, спрашиваются одновременно:
+// - Globalping (globalping.io): три случайные точки в России у разных провайдеров
+//   (Москва, Петербург, регионы - их там больше 150)
+// - check-host.net: узлы в Москве. 07.11 у него осталось два узла из трёх, ru3
+//   пропал, и один неответивший узел оставлял сторожа без ответа из России
+// 'ok' - хоть одна точка получила 200, 'down' - ответили хотя бы две и ни одна не
+// получила 200, null - оба сервиса не дали ответа
+const RU_NODES = ['ru1.node.check-host.net', 'ru2.node.check-host.net'];
 const CHECK_HOST = process.env.STOROZH_CHECK_HOST ?? 'https://check-host.net';
-async function russia(url) {
+const GLOBALPING = process.env.STOROZH_GLOBALPING ?? 'https://api.globalping.io';
+const RU_OFF = process.env.STOROZH_RU_OFF === 'true';
+
+// Ответы точек: массив { ok: true/false } по каждой ответившей точке
+async function viaCheckHost(url) {
   try {
     const q = `host=${encodeURIComponent(url)}&${RU_NODES.map((n) => `node=${n}`).join('&')}`;
     const opts = { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) };
     const { request_id: id } = await (await fetch(`${CHECK_HOST}/check-http?${q}`, opts)).json();
-    if (!id) return null;
+    if (!id) return [];
     let res = {};
     for (let i = 0; i < 8; i += 1) {
       await sleep(3_000);
       res = await (await fetch(`${CHECK_HOST}/check-result/${id}`, { ...opts, signal: AbortSignal.timeout(15_000) })).json();
       if (Object.values(res).every((v) => v !== null)) break;
     }
-    const done = Object.values(res).filter((v) => Array.isArray(v) && Array.isArray(v[0]));
-    if (done.some((v) => v[0][0] === 1 && String(v[0][3]) === '200')) return 'ok';
-    return done.length >= 2 ? 'down' : null;
+    return Object.values(res)
+      .filter((v) => Array.isArray(v) && Array.isArray(v[0]))
+      .map((v) => ({ ok: v[0][0] === 1 && String(v[0][3]) === '200' }));
   } catch (err) {
     console.log(`check-host недоступен: ${err.cause?.code ?? err.message}`);
-    return null;
+    return [];
   }
+}
+
+async function viaGlobalping(url) {
+  try {
+    const u = new globalThis.URL(url);
+    const body = {
+      type: 'http',
+      target: u.hostname,
+      locations: [{ country: 'RU', limit: 3 }],
+      measurementOptions: {
+        protocol: u.protocol === 'https:' ? 'HTTPS' : 'HTTP',
+        request: { path: u.pathname, query: u.search.replace(/^\?/, '') || undefined, method: 'GET' },
+      },
+    };
+    const start = await fetch(`${GLOBALPING}/v1/measurements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const { id } = await start.json();
+    if (!id) { console.log(`Globalping не принял проверку: ответ ${start.status}`); return []; }
+    let m = null;
+    for (let i = 0; i < 10; i += 1) {
+      await sleep(2_000);
+      m = await (await fetch(`${GLOBALPING}/v1/measurements/${id}`, { signal: AbortSignal.timeout(15_000) })).json();
+      if (m.status !== 'in-progress') break;
+    }
+    return (m?.results ?? [])
+      .filter((x) => x.result?.status === 'finished' || x.result?.status === 'failed')
+      .map((x) => ({ ok: x.result.status === 'finished' && x.result.statusCode === 200 }));
+  } catch (err) {
+    console.log(`Globalping недоступен: ${err.cause?.code ?? err.message}`);
+    return [];
+  }
+}
+
+async function russia(url) {
+  if (RU_OFF) return null;
+  const [gp, ch] = await Promise.all([viaGlobalping(url), viaCheckHost(url)]);
+  const all = [...gp, ...ch];
+  console.log(`из России: Globalping ${gp.filter((x) => x.ok).length}/${gp.length}, check-host ${ch.filter((x) => x.ok).length}/${ch.length}`);
+  if (all.some((x) => x.ok)) return 'ok';
+  return all.length >= 2 ? 'down' : null;
 }
 
 async function withRetries(probe) {
@@ -218,7 +275,7 @@ function today(now) {
 }
 
 // Общая смена состояния для прода и записи. fails/oks - сколько проверок подряд
-// не так/так. Сигнал «не работает» - после DOWN_ROUNDS неудачных подряд, «снова
+// не так/так. Сигнал «не работает» - после REAL_ROUNDS подтверждённых неудач подряд, «снова
 // работает» - после UP_ROUNDS удачных. Обрыв короче порога - тихий, только в сводку
 async function step(prev, r, now, texts, onBlip, onOutage) {
   const s = { down: false, fails: 0, oks: 0, ...prev };
@@ -236,10 +293,18 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
   s.oks = 0;
   if (!s.down) {
     s.fails += 1;
-    if (s.fails === 1) { s.firstFail = now; s.real = 0; }
-    // Подтверждённый сбой: сервер ответил ошибкой или не открылся и из России
+    if (s.fails === 1) { s.firstFail = now; s.real = 0; s.unknownTold = false; }
+    // Подтверждённый сбой: сервер ответил ошибкой или не открылся и из России.
+    // Только он даёт тревогу (07.11.2026): раньше через три минуты тревога уходила
+    // и без ответа из России, 07.11 в 15:13 так пришла ложная
     if (!r.net || r.ru === 'down') s.real = (s.real ?? 0) + 1;
-    if (s.real < REAL_ROUNDS && s.fails < DOWN_ROUNDS) return s;
+    if (s.real < REAL_ROUNDS) {
+      if (s.fails >= UNKNOWN_ROUNDS && !s.unknownTold && texts.unknown) {
+        await tell(texts.unknown(s.firstFail));
+        s.unknownTold = true;
+      }
+      return s;
+    }
     await tell(texts.down(r, s.firstFail));
     return { down: true, since: s.firstFail, reminded: now, why: r.why, fails: 0, oks: 0 };
   }
@@ -254,7 +319,6 @@ async function step(prev, r, now, texts, onBlip, onOutage) {
 // Что значит ответ прода - чтобы сообщение сразу говорило, куда смотреть
 function prodCause(r) {
   if (r.net && r.ru === 'down') return 'сервер не открывается ни из США, ни из Москвы и Петербурга - скорее всего лежит Amvera. Смотри панель Amvera';
-  if (r.net) return 'сервер не отвечает из США, проверить из России не удалось. Часто это обрыв связи США - Amvera, а не падение';
   if (r.status === 500) return 'сервер работает, но не достучался до базы. Первым делом проверь базу proddb в панели Amvera';
   if (r.status >= 502 && r.status <= 504) return 'Amvera не видит запущенное приложение: оно перезапускается или упало. Если не пройдёт за 5 минут - смотри журнал приложения в панели Amvera';
   return 'сервер отвечает не так, как должен';
@@ -289,6 +353,7 @@ async function round() {
   state.prod = await step(state.prod, prod, now, {
     down: (r, since) => `🔴 Wellstage не работает с ${hm(since)} МСК (${r.why}).\nКабинеты клиентов и онлайн-запись сейчас не открываются.\nЧто это значит: ${prodCause(r)}\n\n${PROVERIT_TEKST}`,
     still: (since, at, r) => `🔴 Wellstage всё ещё не работает: ${dur(at - since)} (${r.why})\nПроверить: ${PROVERIT}`,
+    unknown: (since) => `⚪️ Сторож не может проверить Wellstage: с ${hm(since)} МСК сервер не открывается из США, а проверить из России не удалось ни через Globalping, ни через check-host. Падение это или обрыв связи США - Россия, сторож не знает. Тревогу не поднимает, проверяет дальше\n\n${PROVERIT_TEKST}`,
     back: (since, at) => {
       const restart = state.startedAt && Date.parse(state.startedAt) >= since
         ? `\nСервер за это время перезапустился в ${hm(Date.parse(state.startedAt))}`
